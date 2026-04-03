@@ -1,121 +1,139 @@
+/* USER CODE BEGIN Header */
+/**
+ * @brief   : Module 7E2 - Mutex Shared OLED Display + ESP32 UART Data
+ * @course  : STM32 Professional - Altrobyte Automation
+ * @author  : Pawan Meena (modified)
+ */
+/* USER CODE END Header */
+
 #include "FreeRTOS.h"
 #include "task.h"
-#include "queue.h"
 #include "main.h"
-#include "ssd1306.h"
-#include "ssd1306_fonts.h"
+
+/* USER CODE BEGIN Includes */
 #include <stdio.h>
 #include <string.h>
-#include <stdlib.h>
+#include "semphr.h"
+#include "ssd1306.h"
+#include "ssd1306_fonts.h"
+/* USER CODE END Includes */
 
-/* External handles from main.c */
-extern UART_HandleTypeDef huart1;
-extern QueueHandle_t uart_to_oled_queue;
+/* USER CODE BEGIN Variables */
+extern I2C_HandleTypeDef hi2c1;
 
-/**
- * TASK 3: UART RECEIVE
- * Receives ASCII data from ESP32, converts to integer, and sends to Queue.
- */
-void StartTask3_UARTReceive(void const *argument) {
-    char frame_buf[16];
-    uint8_t idx = 0;
-    uint8_t byte;
+SemaphoreHandle_t oledMutex = NULL;
 
-    memset(frame_buf, 0, sizeof(frame_buf));
-    printf("[UART] Task Started. Clean Sync Mode...\r\n");
+volatile uint32_t g_counter = 0;
 
-    for (;;) {
-        // 1. We wait indefinitely (or 10ms) for a single byte
-        if (HAL_UART_Receive(&huart1, &byte, 1, 10) == HAL_OK) {
+/* ── Shared with main.c UART ISR ── */
+extern char             esp_data[16];
+extern volatile uint8_t esp_data_new;
+/* USER CODE END Variables */
 
-            // 2. If we hit a terminator, process immediately
-            if (byte == '\n' || byte == '\r') {
-                if (idx > 0) {
-                    frame_buf[idx] = '\0';
-                    uint32_t val = (uint32_t)atoi(frame_buf);
+/* USER CODE BEGIN FunctionPrototypes */
+void StartDisplayTask(void const * argument);
 
-                    // Only send valid data to OLED
-                    xQueueSend(uart_to_oled_queue, &val, 0);
+/* USER CODE END FunctionPrototypes */
 
-                    idx = 0; // Reset for next number
-                    // Do NOT delay here anymore; we want to be ready for the next byte
-                }
-            }
-            // 3. Only accept numeric characters to prevent "mushing"
-            else if (byte >= '0' && byte <= '9') {
-                if (idx < sizeof(frame_buf) - 1) {
-                    frame_buf[idx++] = byte;
-                }
-            }
-            // 4. If we see anything else (like noise), we treat it as a reset
-            else {
-                idx = 0;
-            }
-        } else {
-            // No data? Yield to other tasks
-        	vTaskDelay(1);        }
-    }
-}
-
-/**
- * TASK 4: OLED DISPLAY
- * Consumes data from Queue and renders it to the SSD1306.
- */
-void StartTask4_OLEDDisplay(void const *argument) {
-    uint32_t received_val = 0;
-    char str[16];
-
-    vTaskDelay(pdMS_TO_TICKS(1000));
-
-        // Force a "Bus Clear" - Sometimes I2C gets stuck in a BUSY state
-    __HAL_I2C_DISABLE(&hi2c1);
-    HAL_Delay(10);
-    __HAL_I2C_ENABLE(&hi2c1);
-
-    printf("[OLED] Attempting Init...\r\n");
-    ssd1306_Init();
-    printf("[OLED] Init Passed!\r\n"); // <-- We need to reach this line!
-
-    for (;;) {
-        // Increase timeout to 2 seconds to be very patient
-        if (xQueueReceive(uart_to_oled_queue, &received_val, pdMS_TO_TICKS(2000)) == pdPASS) {
-            printf("[OLED] Processing: %lu\r\n", (unsigned long)received_val);
-
-            snprintf(str, sizeof(str), "%lu", (unsigned long)received_val);
-
-            ssd1306_Fill(Black);
-            ssd1306_SetCursor(0, 0);
-            ssd1306_WriteString("pot value:", Font_11x18, White);
-            ssd1306_SetCursor(0, 30);
-            ssd1306_WriteString(str, Font_11x18, White);
-            ssd1306_UpdateScreen();
-        } else {
-            printf("[OLED] Waiting for data...\r\n");
-        }
-    }
-}
-
-
-/* FreeRTOS Static Allocation Helpers */
-
-/* --- FreeRTOS Static Allocation Helpers --- */
-
-/* * vApplicationGetIdleTaskMemory: Required when configSUPPORT_STATIC_ALLOCATION is 1.
- * This provides the memory for the Idle Task which runs when no other tasks are ready.
- */
 void vApplicationGetIdleTaskMemory(StaticTask_t **ppxIdleTaskTCBBuffer,
                                    StackType_t  **ppxIdleTaskStackBuffer,
                                    uint32_t      *pulIdleTaskStackSize)
 {
-    static StaticTask_t xIdleTaskTCBBuffer;
-    /* configMINIMAL_STACK_SIZE is usually 128 words */
-    static StackType_t  xIdleStack[configMINIMAL_STACK_SIZE];
-
-    *ppxIdleTaskTCBBuffer   = &xIdleTaskTCBBuffer;
-    *ppxIdleTaskStackBuffer = &xIdleStack[0];
-    *pulIdleTaskStackSize   = configMINIMAL_STACK_SIZE;
+  static StaticTask_t xIdleTaskTCBBuffer;
+  static StackType_t  xIdleStack[configMINIMAL_STACK_SIZE];
+  *ppxIdleTaskTCBBuffer  = &xIdleTaskTCBBuffer;
+  *ppxIdleTaskStackBuffer = &xIdleStack[0];
+  *pulIdleTaskStackSize  = configMINIMAL_STACK_SIZE;
 }
 
-/* * NOTE: vApplicationGetTimerTaskMemory was removed because
- * configUSE_TIMERS is likely set to 0 in your FreeRTOSConfig.h.
- */
+/* USER CODE BEGIN Application */
+
+/* ================================================================
+ * DISPLAY TASK
+ * Layout on 128x64 OLED:
+ *   Line 0 (y=0 ): "ESP32 Data:"          — static label
+ *   Line 1 (y=16): "XXXX"                 — live 4-digit value from ESP32
+ *   Line 2 (y=36): " Up: NNs"   — internal uptime
+ *   Line 3 (y=54): "Altrobyte FreeRTOS"   — branding
+ * ================================================================ */
+void StartDisplayTask(void const * argument)
+{
+    if (oledMutex == NULL)
+    {
+        printf("[DISPLAY] ERROR: oledMutex is NULL. Exiting task.\r\n");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    ssd1306_Init();
+    ssd1306_Fill(Black);
+    ssd1306_UpdateScreen();
+
+    printf("[DISPLAY] OLED initialized. Starting display loop.\r\n");
+
+    char line_esp[20];
+    char line_status[24];
+
+    for (;;)
+    {
+        if (xSemaphoreTake(oledMutex, pdMS_TO_TICKS(100)) == pdTRUE)
+        {
+            /* ===== CRITICAL SECTION ===== */
+
+            ssd1306_Fill(Black);
+
+            /* ── Row 0: Static label ── */
+            ssd1306_SetCursor(0, 0);
+            ssd1306_WriteString("ESP32 Data:", Font_7x10, White);
+
+            /* ── Row 1: Live ESP32 value — large font, centred ──
+             * Copy snapshot of esp_data inside the mutex so ISR
+             * cannot overwrite it while we are reading             */
+            strncpy(line_esp, (char *)esp_data, sizeof(line_esp) - 1);
+            line_esp[sizeof(line_esp) - 1] = '\0';
+
+            if (esp_data_new)
+                esp_data_new = 0;   /* clear flag inside mutex */
+
+            ssd1306_SetCursor(0, 16);
+            ssd1306_WriteString(line_esp, Font_11x18, White);  /* big text */
+
+            /* ── Row 2: Counter + Uptime ── */
+            uint32_t uptime = xTaskGetTickCount() / 1000;
+            snprintf(line_status, sizeof(line_status),
+                     "Uptime:%lus",
+
+                     (unsigned long)uptime);
+            ssd1306_SetCursor(0, 38);
+            ssd1306_WriteString(line_status, Font_6x8, White);
+
+            /* ── Row 3: Branding ── */
+            ssd1306_SetCursor(0, 54);
+            ssd1306_WriteString("PRAVEEN KUMAR", Font_6x8, White);
+
+            ssd1306_UpdateScreen();
+
+            /* ===== END CRITICAL SECTION ===== */
+
+            printf("[DISPLAY] ESP=%s | Uptime=%lus\r\n",
+                   line_esp,
+
+                   (unsigned long)uptime);
+
+            xSemaphoreGive(oledMutex);
+        }
+        else
+        {
+            printf("[DISPLAY] WARNING: Mutex timeout! OLED update skipped.\r\n");
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+}
+
+/* ================================================================
+ * COUNTER TASK  (unchanged — still increments every 1000ms)
+ * ================================================================ */
+
+
+/* USER CODE END Application */

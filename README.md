@@ -115,7 +115,7 @@ The CPU is free between bytes; no busy-waiting, no dropped newlines.
 | Component        | Part                       |
 |------------------|----------------------------|
 | MCU — Producer   | ESP32-WROOM-32             |
-| MCU — Consumer   | STM32F103C8T6 (Blue Pill)  |
+| MCU — Consumer   | STM32F103RB  (NUCLEO)  |
 | Display          | SSD1306 128×64 I2C OLED    |
 | Sensor           | 10 kΩ Potentiometer        |
 | Programmer       | ST-Link V2                 |
